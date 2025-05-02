@@ -39,14 +39,31 @@ LLM engine. You can refer to the `vllm.engine.arg_utils.EngineArgs` for more
 details.
 """
 
+import contextlib
 import dataclasses
+import os
 import random
 import time
 
 from vllm import LLM, SamplingParams
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils import FlexibleArgumentParser
+from lmcache.experimental.cache_engine import LMCacheEngineBuilder
+from lmcache.integration.vllm.utils import ENGINE_NAME
+from vllm.config import KVTransferConfig
 
+
+def setup_lmcache(vllm_version: str):
+    # LMCache-related environment variables
+    os.environ["LMCACHE_USE_EXPERIMENTAL"] = "True"
+    os.environ["LMCACHE_CHUNK_SIZE"] = "512"
+    os.environ["LMCACHE_LOCAL_CPU"] = "True"
+    os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "20.0"
+
+    if vllm_version == "v0":
+        return "LMCacheConnector"
+    else:
+        return "LMCacheConnectorV1"
 
 def test_long_document_qa(llm=None, sampling_params=None, prompts=None):
     """
@@ -104,7 +121,9 @@ def repeat_prompts(prompts, repeat_count, mode: str):
 
 def main(args):
     random.seed(args.shuffle_seed)
+    print(args)
 
+    
     # Prepare the prompts:
     # we append the document id at the beginning to avoid any of the document
     # being the prefix of other documents
@@ -122,22 +141,42 @@ def main(args):
 
     # Create the LLM engine
     engine_args = EngineArgs.from_cli_args(args)
-    llm = LLM(**dataclasses.asdict(engine_args))
-    sampling_params = SamplingParams(temperature=0, max_tokens=args.output_len)
 
-    print("------warm up------")
-    test_long_document_qa(
-        llm=llm,
-        prompts=warmup_prompts,
-        sampling_params=sampling_params,
-    )
+    if args.enable_lmcache:
+        lmcache_connector = setup_lmcache(args.version)
+        print(f"Using LMCache connector: {lmcache_connector}")
+    
+        ktc = KVTransferConfig(
+            kv_connector=lmcache_connector,
+            kv_role="kv_both", # LMCache 用于存储和加载 KV cache
+        )
+        engine_args.kv_transfer_config = ktc
 
-    print("------start generating------")
-    test_long_document_qa(
-        llm=llm,
-        prompts=prompts,
-        sampling_params=sampling_params,
-    )
+        if args.version == "v0":
+            engine_args.enable_chunked_prefill = True
+
+    llm = None
+    try:
+        llm = LLM(**dataclasses.asdict(engine_args))
+        sampling_params = SamplingParams(temperature=0, max_tokens=args.output_len)
+
+        print("------warm up------")
+        test_long_document_qa(
+            llm=llm,
+            prompts=warmup_prompts,
+            sampling_params=sampling_params,
+        )
+
+        print("------start generating------")
+        test_long_document_qa(
+            llm=llm,
+            prompts=prompts,
+            sampling_params=sampling_params,
+        )
+    finally:
+        if args.enable_lmcache:
+            print("Cleaning up LMCache backend...")
+            LMCacheEngineBuilder.destroy(ENGINE_NAME)
 
 
 if __name__ == "__main__":
@@ -164,7 +203,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--repeat-count',
                         type=int,
-                        default=2,
+                        default=1,
                         help='Number of times to repeat each prompt')
 
     parser.add_argument("--repeat-mode",
@@ -178,6 +217,15 @@ if __name__ == "__main__":
                         type=int,
                         default=0,
                         help='Random seed when the repeat mode is "random"')
+    
+    parser.add_argument("--enable-lmcache",
+                        action='store_true',
+                        help='Enable LMCache integration')
+
+    parser.add_argument("-v", "--version",
+                        choices=["v0", "v1"],
+                        default='v1',
+                        help='Specify vLLM version for LMCache connector')
 
     parser = EngineArgs.add_cli_args(parser)
     args = parser.parse_args()

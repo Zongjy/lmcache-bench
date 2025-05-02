@@ -2,6 +2,7 @@
 """Benchmark the latency of processing a single batch of requests."""
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import os
@@ -19,6 +20,9 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.sampling_params import BeamSearchParams
 from vllm.utils import FlexibleArgumentParser
+from lmcache.experimental.cache_engine import LMCacheEngineBuilder
+from lmcache.integration.vllm.utils import ENGINE_NAME
+from vllm.config import KVTransferConfig
 
 
 def save_to_pytorch_benchmark_format(args: argparse.Namespace,
@@ -32,82 +36,115 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
         pt_file = f"{os.path.splitext(args.output_json)[0]}.pytorch.json"
         write_to_json(pt_file, pt_records)
 
+def setup_lmcache(vllm_version: str):
+    # LMCache-related environment variables
+    os.environ["LMCACHE_USE_EXPERIMENTAL"] = "True"
+    os.environ["LMCACHE_CHUNK_SIZE"] = "512"
+    os.environ["LMCACHE_LOCAL_CPU"] = "True"
+    os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "20.0"
+
+    if vllm_version == "v0":
+        return "LMCacheConnector"
+    else:
+        return "LMCacheConnectorV1"
+
 
 def main(args: argparse.Namespace):
     print(args)
 
     engine_args = EngineArgs.from_cli_args(args)
+    
+    if args.enable_lmcache:
+        lmcache_connector = setup_lmcache(args.version)
+        print(f"Using LMCache connector: {lmcache_connector}")
+    
+        ktc = KVTransferConfig(
+            kv_connector=lmcache_connector,
+            kv_role="kv_both", # LMCache 用于存储和加载 KV cache
+        )
+        engine_args.kv_transfer_config = ktc
+
+        if args.version == "v0":
+            engine_args.enable_chunked_prefill = True
+
+
 
     # NOTE(woosuk): If the request cannot be processed in a single batch,
     # the engine will automatically process the request in multiple batches.
-    llm = LLM(**dataclasses.asdict(engine_args))
-    assert llm.llm_engine.model_config.max_model_len >= (
-        args.input_len +
-        args.output_len), ("Please ensure that max_model_len is greater than"
-                           " the sum of input_len and output_len.")
+    llm = None
+    try:
+        llm = LLM(**dataclasses.asdict(engine_args))
+        assert llm.llm_engine.model_config.max_model_len >= (
+            args.input_len +
+            args.output_len), ("Please ensure that max_model_len is greater than"
+                            " the sum of input_len and output_len.")
 
-    sampling_params = SamplingParams(
-        n=args.n,
-        temperature=1.0,
-        top_p=1.0,
-        ignore_eos=True,
-        max_tokens=args.output_len,
-        detokenize=not args.disable_detokenize,
-    )
-    print(sampling_params)
-    dummy_prompt_token_ids = np.random.randint(10000,
-                                               size=(args.batch_size,
-                                                     args.input_len))
-    dummy_prompts: list[PromptType] = [{
-        "prompt_token_ids": batch
-    } for batch in dummy_prompt_token_ids.tolist()]
+        sampling_params = SamplingParams(
+            n=args.n,
+            temperature=1.0,
+            top_p=1.0,
+            ignore_eos=True,
+            max_tokens=args.output_len,
+            detokenize=not args.disable_detokenize,
+        )
+        print(sampling_params)
+        dummy_prompt_token_ids = np.random.randint(10000,
+                                                size=(args.batch_size,
+                                                        args.input_len))
+        dummy_prompts: list[PromptType] = [{
+            "prompt_token_ids": batch
+        } for batch in dummy_prompt_token_ids.tolist()]
 
-    def llm_generate():
-        if not args.use_beam_search:
-            llm.generate(dummy_prompts,
-                         sampling_params=sampling_params,
-                         use_tqdm=False)
-        else:
-            llm.beam_search(
-                dummy_prompts,
-                BeamSearchParams(
-                    beam_width=args.n,
-                    max_tokens=args.output_len,
-                    ignore_eos=True,
-                ),
-            )
+        def llm_generate():
+            if not args.use_beam_search:
+                llm.generate(dummy_prompts,
+                            sampling_params=sampling_params,
+                            use_tqdm=False)
+            else:
+                llm.beam_search(
+                    dummy_prompts,
+                    BeamSearchParams(
+                        beam_width=args.n,
+                        max_tokens=args.output_len,
+                        ignore_eos=True,
+                    ),
+                )
 
-    def run_to_completion(profile_dir: Optional[str] = None):
-        if profile_dir:
-            with torch.profiler.profile(
-                    activities=[
-                        torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA,
-                    ],
-                    on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                        str(profile_dir)),
-            ) as p:
+        def run_to_completion(profile_dir: Optional[str] = None):
+            if profile_dir:
+                with torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                            str(profile_dir)),
+                ) as p:
+                    llm_generate()
+                print(p.key_averages().table(sort_by="self_cuda_time_total"))
+            else:
+                start_time = time.perf_counter()
                 llm_generate()
-            print(p.key_averages().table(sort_by="self_cuda_time_total"))
-        else:
-            start_time = time.perf_counter()
-            llm_generate()
-            end_time = time.perf_counter()
-            latency = end_time - start_time
-            return latency
+                end_time = time.perf_counter()
+                latency = end_time - start_time
+                return latency
 
-    print("Warming up...")
-    for _ in tqdm(range(args.num_iters_warmup), desc="Warmup iterations"):
-        run_to_completion(profile_dir=None)
+        print("Warming up...")
+        for _ in tqdm(range(args.num_iters_warmup), desc="Warmup iterations"):
+            run_to_completion(profile_dir=None)
 
-    if args.profile:
-        profile_dir = args.profile_result_dir
-        if not profile_dir:
-            profile_dir = (Path(".") / "vllm_benchmark_result" /
-                           f"latency_result_{time.time()}")
-        print(f"Profiling (results will be saved to '{profile_dir}')...")
-        run_to_completion(profile_dir=profile_dir)
-        return
+        if args.profile:
+            profile_dir = args.profile_result_dir
+            if not profile_dir:
+                profile_dir = (Path(".") / "vllm_benchmark_result" /
+                            f"latency_result_{time.time()}")
+            print(f"Profiling (results will be saved to '{profile_dir}')...")
+            run_to_completion(profile_dir=profile_dir)
+            return
+    finally:
+        if args.enable_lmcache:
+            print("Cleaning up LMCache backend...")
+            LMCacheEngineBuilder.destroy(ENGINE_NAME)
 
     # Benchmark.
     latencies = []
@@ -179,6 +216,18 @@ if __name__ == "__main__":
         action="store_true",
         help=("Do not detokenize responses (i.e. do not include "
               "detokenization time in the latency measurement)"),
+    )
+    parser.add_argument(
+        "--enable-lmcache",
+        action="store_true",
+        help="Enable LMCache integration (default: disabled)",
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        choices=["v0", "v1"],
+        default="v1",
+        help="Specify vLLM version for LMCache connector (default: v1)",
     )
 
     parser = EngineArgs.add_cli_args(parser)
