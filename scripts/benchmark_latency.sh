@@ -1,6 +1,7 @@
 # !/bin/bash
 
 WORKSPACE=$(pwd)
+mkdir -p $WORKSPACE/results
 
 python $WORKSPACE/benchmarks/benchmark_latency.py \
     --model meta-llama/Meta-Llama-3.1-8B-Instruct \
