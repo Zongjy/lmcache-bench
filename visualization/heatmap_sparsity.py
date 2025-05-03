@@ -7,14 +7,18 @@ import numpy as np
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from matplotlib import font_manager
+
+font_path = '/home/liyi/lmcache/SimHei.ttf'
+cn_font = font_manager.FontProperties(fname=font_path) 
 
 def parse_args():
     p = argparse.ArgumentParser("Visualize Attention Heatmap")
     p.add_argument('--model_name',   type=str,   default='meta-llama/Meta-Llama-3.1-8B-Instruct')
-    p.add_argument('--seq_len',      type=int,   default=4096)
+    p.add_argument('--seq_len',      type=int,   default=256)
     p.add_argument('--num_samples',  type=int,   default=1)
     p.add_argument('--layer_idx',    type=int,   default=0, help="Which layer to plot (0-based)")
-    p.add_argument('--save_dir',     type=str,   default='./visualization')
+    p.add_argument('--save_dir',     type=str,   default='/home/liyi/lmcache/visualization')
     p.add_argument('--seed',         type=int,   default=227)
     return p.parse_args()
 
@@ -61,17 +65,27 @@ def plot_attention_heatmap(attns, layer_idx, seq_len, save_path=None):
     save_path: if provided, will save the figure
     """
     # select layer, batch=0, average over heads
-    A = attns[layer_idx][0].mean(0).cpu().numpy()  # (seq_len, seq_len)
+    A = attns[layer_idx][0].float().mean(0).cpu().numpy()  # (seq_len, seq_len)
     # normalize per query (row)
     row_max = A.max(axis=1, keepdims=True) + 1e-12
     A_norm = A / row_max
 
-    plt.figure(figsize=(8, 6))
-    im = plt.imshow(A_norm, origin='lower', aspect='auto')
-    plt.colorbar(im, label='Normalized Attention Score')
-    plt.xlabel('Key Position (k)', fontsize=12)
-    plt.ylabel('Query Position (q)', fontsize=12)
-    plt.title(f'Layer {layer_idx+1} Attention Heatmap', fontsize=14)
+    A_tril = np.tril(A_norm)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(
+            A_tril, 
+            cmap='PuBu',
+            aspect='auto',
+            origin='upper',
+        )  
+    ax.set_xticks([])
+    ax.set_yticks([])
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('注意力分数（标准化）', fontsize=12, fontproperties=cn_font)
+    ax.set_xlabel('键向量位置（key Position）', fontsize=14, fontproperties=cn_font)
+    ax.set_ylabel('查询位置（Query Position）', fontsize=14, fontproperties=cn_font)
+    ax.set_title('注意力热图', fontsize=16, fontproperties=cn_font)
     plt.tight_layout()
 
     if save_path:
